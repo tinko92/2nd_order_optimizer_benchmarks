@@ -1,0 +1,318 @@
+<html>
+  <head>
+    <link href="https://cdn.datatables.net/v/dt/dt-2.1.8/sl-2.1.0/datatables.min.css" rel="stylesheet">
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
+    <script src='/frontend/3rdparty/sql-wasm.js'></script>
+    <script src="https://cdn.datatables.net/v/dt/dt-2.1.8/sl-2.1.0/datatables.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+    <script>
+    var db;
+    var table;
+    var optimizers, datasets, criteria, models, runs;
+
+    function HtmlEncode(s) {
+      var el = document.createElement("div");
+      el.innerText = el.textContent = s;
+      s = el.innerHTML;
+      return s;
+    }
+
+    function fetch_assoc(db, statement) {
+      const result = db.exec(statement)[0];
+      return result.values.reduce((map, row) => {
+        map[row[0]] = result.columns.reduce((obj, col_name, col_index)=>{
+			    obj[col_name] = col_name === 'label' ? row[col_index].replaceAll('<class \'','').replaceAll('torch.optim.','').replaceAll('pytorch_optimizer.optimizer.fadam.','').replaceAll('lbfgs.','').replaceAll('\'>','').replaceAll('optimizers.sophia.','').replaceAll('rmsprop.','').replaceAll('sgd.','').replaceAll('adam.','') : row[col_index];
+          return obj;
+        },{});
+        return map;
+      }, {})
+    }
+
+    function fetch_array(db, statement) {
+      const db_result = db.exec(statement);
+      console.log(db_result);
+      const result = db_result[0];
+      return result.values.reduce((arr, row) => {
+        arr.push(result.columns.reduce((obj, col_name, col_index)=>{
+          obj[col_name] = row[col_index];
+          return obj;
+        },{}));
+        return arr;
+      }, [])
+    }
+
+    const x_types = {
+      time: {
+        label: "Time in s",
+        mapper: (step, i, run) => step.wall_clock_time - run.steps[0].wall_clock_time + 1
+      },
+      iterations: {
+        label: "Iterations #",
+        mapper: (step, i) => (i + 1)*10
+      }
+    };
+
+    const y_types = {
+      none: undefined,
+      loss: {
+        label: "Loss",
+        mapper: (step) => step.loss
+      }
+    }
+
+    const aggregate_types = {
+			ram: {
+				label: "Max RAM in GB",
+				mapper: (run) => run.max_ram / (1024*1024*1024)
+			},
+			min_loss: {
+				label: "Min Loss Obtained",
+				mapper: (run) => run.min_loss
+			},
+			model_params: {
+				label: "Model Parameters #",
+				mapper: (run) => run.model.trainable_params
+			},
+			iteration_cost: {
+				label: "ms/iter",
+				mapper: (run) => (run.steps[run.steps.length-1].wall_clock_time - run.steps[0].wall_clock_time) / run.steps.length
+			},
+			time_to_near_min: {
+				label: "ms till <min+5%",
+				mapper: (run) => (run.steps.find((step)=>step.loss < run.min_loss * 1.05).wall_clock_time - run.steps[0].wall_clock_time)
+			}
+
+	}
+
+    const graph_update = () => {
+      const x_axis_type = document.querySelector('input[name="x-type"]:checked').value;
+      const x_axis_scale = document.querySelector('input[name="x-scale"]:checked').value;
+      const y1_axis_type = document.querySelector('input[name="y1-type"]:checked').value;
+      const y1_axis_scale = document.querySelector('input[name="y1-scale"]:checked').value;
+      const y2_axis_type = document.querySelector('input[name="y2-type"]:checked').value;
+      const y2_axis_scale = document.querySelector('input[name="y2-scale"]:checked').value;
+      const x_type = x_types[x_axis_type]
+      const y1_type = y_types[y1_axis_type]
+      const y2_type = y_types[y2_axis_type]
+
+      const run_ids_selected = Array.from(table.rows('.selected').data()).map((r)=>r.id);
+      const runs_selected = run_ids_selected.map((run_id) => ({
+        id: run_id,
+	...runs[run_id],
+        dataset: datasets[runs[run_id].dataset],
+        model: models[runs[run_id].model],
+        optimizer: optimizers[runs[run_id].optimizer],
+        criterion: criteria[runs[run_id].criterion],
+        seed: runs[run_id].seed,
+        steps: fetch_array(db, "SELECT * FROM step WHERE run ="+run_id)
+      }))
+      const data = runs_selected.map((run) => ({
+        x: run.steps.map((step, i) => x_type.mapper(step, i, run)),
+        y: run.steps.map((step, i) => y1_type.mapper(step, i, run)),
+        type: 'lines',
+        name: '#'+run.id+' '+run.optimizer.label
+      })).concat( y2_type === undefined ? [] : runs_selected.map((run)=>({
+        x: run.steps.map((step, i) => x_type.mapper(step, i, run)),
+        y: run.steps.map((step, i) => y2_type.mapper(step, i, run)),
+        type: 'lines',
+        name: '#'+run.id+' y2 '+run.optimizer.label,
+        yaxis: 'y2'
+      })) )
+      console.log(x_axis_scale)
+      Plotly.newPlot('graph', data, { 
+        title: { text: 'Run' },
+        xaxis: { title: { text: x_type.label }, type: x_axis_scale },
+        yaxis: { title: { text: y1_type.label }, type: y1_axis_scale },
+        yaxis2: y2_type === undefined ? {} : { title: { text: y2_type.label }, overlaying: 'y', side: 'right', type: y2_axis_scale } })
+      const metadata = document.getElementById("metadata")
+      metadata.innerHTML = ''
+      const ol = document.createElement('ol')
+      runs_selected.forEach((run) => {
+        const upper_li = document.createElement('li')
+        upper_li.innerHTML = '#'+run.id
+        const ul = document.createElement('ul')
+        const op = document.createElement('li')
+        op.innerHTML = '<b>Optimizer: </b>'+HtmlEncode(run.optimizer.label)+', lr: '+run.optimizer.lr+'<br />'+HtmlEncode(run.optimizer.all_parameters)
+        const mo = document.createElement('li')
+	mo.innerHTML = '<b>Model: </b> '+HtmlEncode(run.model.label)+'<br /><button class="accordion">Details</button><div class="panel">'+HtmlEncode(run.model.description)+'</div>'
+        const ds = document.createElement('li')
+        ds.innerHTML = '<b>Dataset: </b>'+HtmlEncode(run.dataset.label)+'<br />'+HtmlEncode(run.dataset.description)
+        const cr = document.createElement('li')
+        cr.innerHTML = '<b>Loss Function: </b>'+HtmlEncode(run.criterion.label)
+        const se = document.createElement('li')
+        se.innerHTML = 'Seed: '+run.seed
+        const st = document.createElement('li')
+        st.innerHTML = 'Iterations: '+run.steps.length
+        ul.appendChild(op)
+        ul.appendChild(mo)
+        ul.appendChild(ds)
+        ul.appendChild(cr)
+        ul.appendChild(se)
+        ul.appendChild(st)
+        upper_li.appendChild(ul)
+        ol.appendChild(upper_li)
+      })
+      metadata.appendChild(ol)
+      update_accordion();
+      const aggregate_x_index = document.querySelector('input[name="aggregate-x-type"]:checked').value;
+      const aggregate_y_index = document.querySelector('input[name="aggregate-y-type"]:checked').value;
+      const aggregate_x = aggregate_types[aggregate_x_index]
+      const aggregate_y = aggregate_types[aggregate_y_index]
+      Plotly.newPlot('scatter',
+	runs_selected.map((run) => ({marker: {size: 40}, x: [aggregate_x.mapper(run)], y: [aggregate_y.mapper(run)], mode: 'markers+text', text: ['#'+run.id+' '+run.optimizer.label], type: 'scatter', textfont: {
+    size: 18
+  }, name: '#'+run.id+' '+run.optimizer.label })),
+	{ xaxis: {title: { text: aggregate_x.label, font: { family: 'Arial, sans-serif', size: 40, color: 'black'} }}, yaxis: {  title:{font: { family: 'Arial, sans-serif', size: 40},text:aggregate_y.label}}})
+    };
+
+    async function init_db() {
+      const sqlPromise = initSqlJs({
+        locateFile: file => `/frontend/3rdparty/${file}`
+       });
+      const dataPromise = fetch("/results.db").then(res => res.arrayBuffer());
+      const [SQL, buf] = await Promise.all([sqlPromise, dataPromise])
+      db = new SQL.Database(new Uint8Array(buf));
+      optimizers = fetch_assoc(db, "SELECT * FROM optimizer;")
+      criteria = fetch_assoc(db, "SELECT * FROM criterion;")
+      models = fetch_assoc(db, "SELECT * FROM model;")
+      datasets = fetch_assoc(db, "SELECT * FROM dataset")
+      runs = fetch_assoc(db, "SELECT * FROM run")
+      const runs_arr = fetch_array(db, "SELECT * FROM run;")
+
+      table = $('#runs-table').DataTable({
+        data : runs_arr,
+        columns : [
+            { data: 'id', render: (id) => '#'+((id + "").padStart(6, "0")), title: 'Run ID'},
+            { data: 'optimizer', render: (oid) => HtmlEncode(optimizers[oid].label), title: 'Optimizer' },
+            { data: 'criterion', render: (cid) => HtmlEncode(criteria[cid].label), title: 'Loss Function' },
+            { data: 'model', render: (mid) => HtmlEncode(models[mid].label), title: 'Model' },
+            { data: 'dataset', render: (did) => HtmlEncode(datasets[did].label), title: 'Dataset' },
+            { data: 'epochs', title: 'Epochs' },
+            { data: 'seed', title: 'Seed' },
+	    { data: 'optimizer', title: 'Learning Rate', render: (oid) => optimizers[oid].lr }
+          ],
+        select: { style: 'multi' }
+      })
+
+      
+      table.on('click', 'tbody tr', function (e) {
+          e.currentTarget.classList.toggle('selected');
+      });
+
+      table.on('select', graph_update );
+      table.on('deselect', graph_update );
+    }
+    init_db();
+    </script>
+  <style>
+    #graph-control { display: grid; grid-template-columns: auto auto auto; }
+	#aggregate-controls { display: grid; grid-template-columns: auto auto; }
+		.panel {
+      padding: 0 18px;
+      background-color: white;
+      display: none;
+      overflow: hidden;
+    }
+  </style>
+  </head>
+  <body>
+    <h1>Result Viewer</h1>
+    <table id='runs-table'></table>
+    <div id='graph-control'>
+      <div id='x-control'>
+        <h2>X Axis</h2>
+        <h3>Type</h3>
+        <input type='radio' onchange='graph_update()' id='x-iterations' name='x-type' value="iterations">
+        <label for='x-iterations'>Iterations</label><br />
+        <input type='radio' onchange='graph_update()' id='x-time' name='x-type' value="time" checked>
+        <label for='x-time'>Time</label>
+      </div>
+      <div id='y1-control'>
+        <h2>Y Axis</h2>
+        <input type='radio' onchange='graph_update()' id='y1-loss' name='y1-type' value='loss' checked>
+        <label for='y1-loss'>Loss</label>
+      </div>
+      <div id='y2-control'>
+        <h2>Secondary Y Axis</h2>
+        <input type='radio' onchange='graph_update()' id='y2-loss' name='y2-type' value='loss'>
+        <label for='y2-loss'>Loss</label><br />
+        <input type='radio' onchange='graph_update()' id='y2-none' name='y2-type' value='none' checked>
+        <label for='y2-none'>None</label>
+      </div>
+      <div>
+        <h3>Scale</h3>
+        <input type='radio' onchange='graph_update()' id='x-linear' name='x-scale' value='linear' checked>
+        <label for='x-linear'>Linear</label><br />
+        <input type='radio' onchange='graph_update()' id='x-log' name='x-scale' value='log'>
+        <label for='x-log'>Logarithmic</label>
+      </div>
+      <div>
+        <h3>Scale</h3>
+        <input type='radio' onchange='graph_update()' id='y1-linear' name='y1-scale' value='linear' checked>
+        <label for='y1-linear'>Linear</label><br />
+        <input type='radio' onchange='graph_update()' id='y1-log' name='y1-scale' value='log'>
+        <label for='y1-log'>Logarithmic</label>
+      </div>
+      <div>
+        <h3>Scale</h3>
+        <input type='radio' onchange='graph_update()' id='y2-linear' name='y2-scale' value='linear' checked>
+        <label for='y2-linear'>Linear</label><br />
+        <input type='radio' onchange='graph_update()' id='y2-log' name='y2-scale' value='log'>
+        <label for='y2-log'>Logarithmic</label>
+      </div>
+    </div>
+    <div id='graph'>
+    </div>
+    <h2>Aggregates</h2>
+    <div id='aggregate-controls'>
+	    <div id='aggregate-x-control'>
+		<input type='radio' onchange='graph_update()' id='aggregate-x-ram' name='aggregate-x-type' value='ram' checked>
+		<label for='aggregate-x-ram'>Max RAM in GB</label><br />
+		<input type='radio' onchange='graph_update()' id='aggregate-x-loss' name='aggregate-x-type' value='min_loss'>
+		<label for='aggregate-x-loss'>Minimum loss</label><br />
+		<input type='radio' onchange='graph_update()' id='aggregate-x-itercost' name='aggregate-x-type' value='iteration_cost'>
+		<label for='aggregate-x-itercost'>ms/iter</label><br />
+		<input type='radio' onchange='graph_update()' id='aggregate-x-params' name='aggregate-x-type' value='model_params'>
+		<label for='aggregate-x-params'>Model Params</label><br />
+		<input type='radio' onchange='graph_update()' id='aggregate-x-nearmin' name='aggregate-x-type' value='time_to_near_min'>
+		<label for='aggregate-x-nearmin'>ms until &lt; min +5%</label>
+	    </div>
+	    <div id='aggregate-y-control'>
+		<input type='radio' onchange='graph_update()' id='aggregate-y-ram' name='aggregate-y-type' value='ram'>
+		<label for='aggregate-y-ram'>Max RAM in GB</label><br />
+		<input type='radio' onchange='graph_update()' id='aggregate-y-loss' name='aggregate-y-type' value='min_loss' checked>
+		<label for='aggregate-y-loss'>Minimum loss</label><br />
+		<input type='radio' onchange='graph_update()' id='aggregate-y-itercost' name='aggregate-y-type' value='iteration_cost'>
+		<label for='aggregate-y-itercost'>ms/iter</label><br />
+		<input type='radio' onchange='graph_update()' id='aggregate-y-params' name='aggregate-y-type' value='model_params'>
+		<label for='aggregate-y-params'>Model Params</label><br />
+		<input type='radio' onchange='graph_update()' id='aggregate-y-nearmin' name='aggregate-y-type' value='time_to_near_min'>
+		<label for='aggregate-y-nearmin'>ms until &lt; min +5%</label>
+	    </div>
+	    </div>
+    </div>
+    <div id='scatter'></div>
+    <h2>Legend</h2>
+    <div id='metadata'>
+    </div>
+  </body>
+	<script>
+    function update_accordion() {
+      var acc = document.getElementsByClassName("accordion");
+      var i;
+
+    for (i = 0; i < acc.length; i++) {
+      acc[i].addEventListener("click", function() {
+        this.classList.toggle("active");
+
+        var panel = this.nextElementSibling;
+        if (panel.style.display === "block") {
+          panel.style.display = "none";
+        } else {
+          panel.style.display = "block";
+        }
+      });
+    }
+    }
+  </script>
+</html>
