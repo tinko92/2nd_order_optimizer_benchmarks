@@ -28,9 +28,9 @@ def run_benchmark(model, OptimizerType, CriterionType, dataloader, epochs, seed=
                 if loss.requires_grad:
                     loss.backward()
                 return loss
-            optimizer.step(closure)
             loss = closure()
             running_loss += loss.item()
+            optimizer.step(closure)
             if i % 10 == 9:    # print every 2000 mini-batches
                 print(i, running_loss / 10)
                 update_hessian = getattr(optimizer, "update_hessian", None)
